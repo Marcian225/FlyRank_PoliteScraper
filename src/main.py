@@ -1,4 +1,3 @@
-import sys
 from pathlib import Path, PurePosixPath 
 import requests
 from bs4 import BeautifulSoup
@@ -18,28 +17,46 @@ MAX_PAGES = 3
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = PROJECT_ROOT / "cache"
-
 OUTPUT_DIR = PROJECT_ROOT / "output"
 
+MAX_ATTEMPTS = 2
+RETRY_DELAY_SECONDS = 2
+STATS = {"pages_fetched": 0, "cache_hits": 0}
 
 def fetch(url):
-    try:
-        response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT_SECONDS)
-    except requests.RequestException as error:
-        print(f"FAILED {url}: {type(error).__name__}")
-        return None
 
-    if response.status_code != 200:
-        print(f"FAILED {url}: status {response.status_code}")
-        return None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        if attempt > 1:
+            print(f"RETRY {url} in {RETRY_DELAY_SECONDS}s (attempt {attempt}/{MAX_ATTEMPTS})")
+            time.sleep(RETRY_DELAY_SECONDS)
 
-    return response.content
+        try:
+            response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT_SECONDS)
+        except requests.Timeout:
+            print(f"FAILED {url}: timeout")
+            continue
+        except requests.RequestException as error:
+            print(f"FAILED {url}: {type(error).__name__}")
+            return None
+
+        if response.status_code >= 500:
+            print(f"FAILED {url}: status {response.status_code}")
+            continue  
+        if response.status_code != 200:
+            print(f"FAILED {url}: status {response.status_code}")
+            return None 
+        
+        return response.content
+    print(f"GAVE UP {url} after {MAX_ATTEMPTS} attempts")
+    return None
+
 
 def get_page(url, cache_name):
     cache_path = CACHE_DIR / cache_name
     if cache_path.exists():
         page = cache_path.read_bytes()
         print(f"CACHE HIT {cache_name} ({len(page)} bytes)")
+        STATS["cache_hits"] += 1
         return page
 
     time.sleep(REQUEST_DELAY_SECONDS)
@@ -49,6 +66,7 @@ def get_page(url, cache_name):
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     cache_path.write_bytes(page)
+    STATS["pages_fetched"] += 1
     print(f"FETCH {url} ({len(page)} bytes)")
     return page
 
@@ -99,10 +117,16 @@ def main():
     page_url = START_URL
     catalogue_pages = 0
     book_links = []
+    failed_pages = []
+    started_at = datetime.now(timezone.utc)
+    start_clock = time.monotonic()
+
+
     while page_url and catalogue_pages < MAX_PAGES:
         page = get_page(page_url, f"catalogue-page-{catalogue_pages + 1}.html")
         if page is None:
-            sys.exit(1)
+            failed_pages.append({"url": url, "reason": "catalogue fetch failed"})
+            break
         catalogue_pages += 1
 
         soup = BeautifulSoup(page, "html.parser")
@@ -113,8 +137,9 @@ def main():
 
     source_by_url = {}
     for url, source_page in book_links:
-        source_by_url.setdefault(url, source_page)  # first sighting wins
+        source_by_url.setdefault(url, source_page)  
     print(f"catalogue_pages={catalogue_pages}, discovered={len(book_links)}, unique_urls={len(source_by_url)}")
+
 
     records_by_url = {}
     for url, source_page in source_by_url.items():
@@ -123,15 +148,21 @@ def main():
         cache_name = book_cache_name(url)
         page = get_page(url, cache_name)
         if page is None:
+            failed_pages.append({"url": url, "reason": "fetch_failed"})
             continue
-        record = extract_book(page, url)
+        try:
+            record = extract_book(page, url)
+        except Exception as error:
+            print(f"FAILED {url}: could not extract ({type(error).__name__}: {error})")
+            failed_pages.append({"url": url, "reason": f"extract failed: {type(error).__name__}"})
+            continue
+
         record["source_page"] = source_page
         record["fetched_at"] = fetched_at(cache_name)
         records_by_url[record["product_url"]] = normalize(record)
 
     records = list(records_by_url.values())
 
-    
     valid_books = []
     errors = []
 
@@ -151,8 +182,20 @@ def main():
 
     write_json(OUTPUT_DIR / "errors.json", errors)
     write_json(OUTPUT_DIR / "books.json", [book.model_dump(mode="json") for book in valid_books])
-    print(f"valid={len(valid_books)}, rejected={len(errors)}")
-
+    report = {
+        "started_at": started_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "duration_seconds": round(time.monotonic() - start_clock, 2),
+        "catalogue_pages": catalogue_pages,
+        "pages_fetched": STATS["pages_fetched"],
+        "cache_hits": STATS["cache_hits"],
+        "valid_records": len(valid_books),
+        "invalid_records": len(errors),
+        "failed_pages": len(failed_pages),
+        "failed_page_details": failed_pages,
+    }
+    write_json(OUTPUT_DIR / "run-report.json", report)
+    print(f"report: {report['valid_records']} valid, {report['invalid_records']} invalid, "
+          f"{report['failed_pages']} failed pages, {report['duration_seconds']}s")
 
 
 if __name__ == "__main__":
